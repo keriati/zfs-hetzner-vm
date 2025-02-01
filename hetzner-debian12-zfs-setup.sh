@@ -49,6 +49,7 @@ c_log_dir=$(dirname "$(mktemp)")/zfs-hetzner-vm
 c_install_log=$c_log_dir/install.log
 c_lsb_release_log=$c_log_dir/lsb_release.log
 c_disks_log=$c_log_dir/disks.log
+c_efimode_enabled="$(if [[ -d /sys/firmware/efi/efivars ]]; then echo 1; else echo 0; fi)"
 
 function activate_debug {
   mkdir -p "$c_log_dir"
@@ -65,9 +66,8 @@ function print_step_info_header {
 # ${FUNCNAME[1]}"
 
   if [[ "${1:-}" != "" ]]; then
-    echo -n " $1" 
+    echo -n " $1"
   fi
-
 
   echo "
 ###############################################################################
@@ -146,7 +146,7 @@ function initial_load_debian_zed_cache {
 
   local success=0
 
-  if [[ ! -e "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" ]] || [[ -e "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" && (( $(find "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" -type f -printf '%s' 2> /dev/null) == 0 )) ]]; then  
+  if [[ ! -e "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" ]] || [[ -e "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" && (( $(find "$c_zfs_mount_dir/etc/zfs/zfs-list.cache/$v_rpool_name" -type f -printf '%s' 2> /dev/null) == 0 )) ]]; then
     chroot_execute "zfs set canmount=noauto $v_rpool_name"
 
     SECONDS=0
@@ -436,7 +436,7 @@ function unmount_and_export_fs {
   zpools_exported=99
   echo "===========exporting zfs pools============="
   set +e
-  while (( zpools_exported == 99 )) && (( SECONDS++ <= 60 )); do    
+  while (( zpools_exported == 99 )) && (( SECONDS++ <= 60 )); do
     if zpool export -a 2> /dev/null; then
       zpools_exported=1
       echo "all zfs pools were succesfully exported"
@@ -466,6 +466,14 @@ find_suitable_disks
 
 select_disks
 
+# --- RAID10 CONFIGURATION CHECK ---
+# Ensure that exactly 4 disks have been selected for the RAID10 configuration.
+if [[ ${#v_selected_disks[@]} -ne 4 ]]; then
+  dialog --msgbox "Error: Exactly 4 disks are required for RAID10 configuration. You selected ${#v_selected_disks[@]}." 10 50
+  exit 1
+fi
+# --- end RAID10 CONFIGURATION CHECK ---
+
 ask_swap_size
 
 ask_free_tail_space
@@ -494,77 +502,83 @@ for kver in $(find /lib/modules/* -maxdepth 0 -type d | grep -v "$(uname -r)" | 
   apt purge --yes "linux-image-$kver"
 done
 
-echo "======= installing zfs on rescue system =========="
-
-  echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections  
-#  echo "y" | zfs
-# linux-headers-generic linux-image-generic
-  apt install --yes software-properties-common dpkg-dev dkms
-  rm -f "$(which zfs)"
-  rm -f "$(which zpool)"
-  echo -e "deb http://deb.debian.org/debian/ testing main contrib non-free\ndeb http://deb.debian.org/debian/ testing main contrib non-free\n" >/etc/apt/sources.list.d/bookworm-testing.list
-  echo -e "Package: src:zfs-linux\nPin: release n=testing\nPin-Priority: 990\n" > /etc/apt/preferences.d/90_zfs
-  apt update  
-  apt install -t testing --yes zfs-dkms zfsutils-linux
-  rm /etc/apt/sources.list.d/bookworm-testing.list
-  rm /etc/apt/preferences.d/90_zfs
-  apt update
-  export PATH=$PATH:/usr/sbin
-  zfs --version
+apt update
+export PATH=$PATH:/usr/sbin
+zfs --version
 
 echo "======= partitioning the disk =========="
 
-  if [[ $v_free_tail_space -eq 0 ]]; then
-    tail_space_parameter=0
+if [[ $v_free_tail_space -eq 0 ]]; then
+  tail_space_parameter=0
+else
+  tail_space_parameter="-${v_free_tail_space}G"
+fi
+
+for selected_disk in "${v_selected_disks[@]}"; do
+  wipefs --all --force "$selected_disk"
+  if (( c_efimode_enabled == 1 )); then
+    sgdisk -a1 -n1:24K:+1G            -t1:EF00 "$selected_disk" # EFI partition
   else
-    tail_space_parameter="-${v_free_tail_space}G"
-  fi
-
-  for selected_disk in "${v_selected_disks[@]}"; do
-    wipefs --all --force "$selected_disk"
     sgdisk -a1 -n1:24K:+1000K            -t1:EF02 "$selected_disk"
-    sgdisk -n2:0:+2G                   -t2:BF01 "$selected_disk" # Boot pool
-    sgdisk -n3:0:"$tail_space_parameter" -t3:BF01 "$selected_disk" # Root pool
-  done
+  fi
+  sgdisk -n2:0:+2G                   -t2:BF01 "$selected_disk" # Boot pool
+  sgdisk -n3:0:"$tail_space_parameter" -t3:BF01 "$selected_disk" # Root pool
+done
 
-  udevadm settle
+udevadm settle
 
 echo "======= create zfs pools and datasets =========="
 
-  encryption_options=()
-  rpool_disks_partitions=()
-  bpool_disks_partitions=()
+# --- RAID10 MODIFICATIONS START ---
+# Instead of the previous approach that built a single array and optionally asked for “mirror mode”,
+# we now assume exactly 4 disks and build a RAID10 configuration (a stripe of two mirrors).
+#
+# (For RAID10 with ZFS you create two mirror vdevs:
+#   mirror disk1 disk2   and   mirror disk3 disk4 )
+#
+# Set up any encryption options first.
+encryption_options=()
+if [[ $v_encrypt_rpool == "1" ]]; then
+  encryption_options=(-O "encryption=aes-256-gcm" -O "keylocation=prompt" -O "keyformat=passphrase")
+fi
 
-  if [[ $v_encrypt_rpool == "1" ]]; then
-    encryption_options=(-O "encryption=aes-256-gcm" -O "keylocation=prompt" -O "keyformat=passphrase")
-  fi
+# Build the vdev arguments for the boot pool and root pool.
+# Here we assume v_selected_disks[0..3] are the four disks.
+bpool_vdev_args=( mirror "${v_selected_disks[0]}-part2" "${v_selected_disks[1]}-part2" \
+                    mirror "${v_selected_disks[2]}-part2" "${v_selected_disks[3]}-part2" )
+rpool_vdev_args=( mirror "${v_selected_disks[0]}-part3" "${v_selected_disks[1]}-part3" \
+                    mirror "${v_selected_disks[2]}-part3" "${v_selected_disks[3]}-part3" )
 
-  for selected_disk in "${v_selected_disks[@]}"; do
-    rpool_disks_partitions+=("${selected_disk}-part3")
-    bpool_disks_partitions+=("${selected_disk}-part2")
-  done
-
-  pools_mirror_option=
-  if [[ ${#v_selected_disks[@]} -gt 1 ]]; then
-    if dialog --defaultno --yesno "Do you want to use mirror mode for ${v_selected_disks[*]}?" 30 100; then 
-      pools_mirror_option=mirror
-    fi
-  fi
-
-# shellcheck disable=SC2086
+# Create the boot pool (bpool) using the RAID10 (stripe of mirrors) configuration.
 zpool create \
-  $v_bpool_tweaks -O canmount=off -O devices=off \
   -o cachefile=/etc/zpool.cache \
+  -o ashift=12 -d \
+  -o compatibility=grub2 \
+  -o feature@async_destroy=enabled \
+  -o feature@bookmarks=enabled \
+  -o feature@embedded_data=enabled \
+  -o feature@empty_bpobj=enabled \
+  -o feature@enabled_txg=enabled \
+  -o feature@extensible_dataset=enabled \
+  -o feature@filesystem_limits=enabled \
+  -o feature@hole_birth=enabled \
+  -o feature@large_blocks=enabled \
+  -o feature@lz4_compress=enabled \
+  -o feature@spacemap_histogram=enabled \
+  -o feature@zpool_checkpoint=enabled \
+  -O acltype=posixacl -O canmount=off -O compression=lz4 \
+  -O devices=off -O normalization=formD -O relatime=on -O xattr=sa \
   -O mountpoint=/boot -R $c_zfs_mount_dir -f \
-  $v_bpool_name $pools_mirror_option "${bpool_disks_partitions[@]}"
+  $v_bpool_name "${bpool_vdev_args[@]}"
 
-# shellcheck disable=SC2086
+# Create the root pool (rpool) with optional encryption using the RAID10 configuration.
 echo -n "$v_passphrase" | zpool create \
   $v_rpool_tweaks \
   -o cachefile=/etc/zpool.cache \
   "${encryption_options[@]}" \
   -O mountpoint=/ -R $c_zfs_mount_dir -f \
-  $v_rpool_name $pools_mirror_option "${rpool_disks_partitions[@]}"
+  $v_rpool_name "${rpool_vdev_args[@]}"
+# --- RAID10 MODIFICATIONS END ---
 
 zfs create -o canmount=off -o mountpoint=none "$v_rpool_name/ROOT"
 zfs create -o canmount=off -o mountpoint=none "$v_bpool_name/BOOT"
@@ -604,6 +618,16 @@ if [[ $v_swap_size -gt 0 ]]; then
   udevadm settle
 
   mkswap -f "/dev/zvol/$v_rpool_name/swap"
+fi
+
+if (( c_efimode_enabled == 1 )); then
+echo "======= create filesystem on EFI partition(s) =========="
+
+  for selected_disk in "${v_selected_disks[@]}"; do
+    mkfs.fat -F32 "${selected_disk}-part1"
+  done
+  mkdir -p "$c_zfs_mount_dir/boot/efi"
+  mount "${v_selected_disks[0]}-part1" "$c_zfs_mount_dir/boot/efi"
 fi
 
 echo "======= setting up initial system packages =========="
@@ -694,7 +718,6 @@ console-setup   console-setup/fontsize-text47   select  8x16
 console-setup   console-setup/codesetcode       string  Lat15
 tzdata tzdata/Areas select Europe
 tzdata tzdata/Zones/Europe select Vienna
-grub-pc grub-pc/install_devices_empty   boolean true
 CONF'
 
 chroot_execute "dpkg-reconfigure locales -f noninteractive"
@@ -752,12 +775,21 @@ echo "========setting up zfs module parameters========"
 chroot_execute "echo options zfs zfs_arc_max=$((v_zfs_arc_max_mb * 1024 * 1024)) >> /etc/modprobe.d/zfs.conf"
 
 echo "======= setting up grub =========="
-chroot_execute "echo 'grub-pc grub-pc/install_devices_empty   boolean true' | debconf-set-selections"
-chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes grub-legacy"
-chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes grub-pc"
-for disk in ${v_selected_disks[@]}; do
-  chroot_execute "grub-install --recheck $disk"
-done
+if (( c_efimode_enabled == 1 )); then
+  chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes grub-efi-amd64"
+else
+  chroot_execute "echo 'grub-pc grub-pc/install_devices_empty   boolean true' | debconf-set-selections"
+  chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes grub-legacy"
+  chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes grub-pc"
+fi
+
+if (( c_efimode_enabled == 1 )); then
+  chroot_execute grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --recheck
+else
+  for disk in ${v_selected_disks[@]}; do
+    chroot_execute "grub-install --recheck $disk"
+  done
+fi
 
 chroot_execute "sed -i 's/#GRUB_TERMINAL=console/GRUB_TERMINAL=console/g' /etc/default/grub"
 chroot_execute "sed -i 's|GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"net.ifnames=0\"|' /etc/default/grub"
@@ -775,7 +807,7 @@ if [[ $v_encrypt_rpool == "1" ]]; then
   echo "=========set up dropbear=============="
 
   chroot_execute "apt install --yes dropbear-initramfs"
-  
+
   mkdir -p "$c_zfs_mount_dir/etc/dropbear/initramfs"
   cp /root/.ssh/authorized_keys "$c_zfs_mount_dir/etc/dropbear/initramfs/authorized_keys"
 
@@ -855,6 +887,10 @@ else
 fi
 
 echo "======= setting mountpoints =========="
+if (( c_efimode_enabled == 1 )); then
+  umount "$c_zfs_mount_dir/boot/efi"
+fi
+
 chroot_execute "zfs set mountpoint=legacy $v_bpool_name/BOOT/debian"
 chroot_execute "echo $v_bpool_name/BOOT/debian /boot zfs nodev,relatime,x-systemd.requires=zfs-mount.service,x-systemd.device-timeout=10 0 0 > /etc/fstab"
 
