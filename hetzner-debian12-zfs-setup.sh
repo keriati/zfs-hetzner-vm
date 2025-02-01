@@ -497,10 +497,10 @@ determine_kernel_variant
 clear
 
 echo "===========remove unused kernels in rescue system========="
-#for kver in $(find /lib/modules/* -maxdepth 0 -type d | grep -v "$(uname -r)" | cut -s -d "/" -f 4); do
-#  apt purge --yes "linux-headers-$kver"
-#  apt purge --yes "linux-image-$kver"
-#done
+for kver in $(find /lib/modules/* -maxdepth 0 -type d | grep -v "$(uname -r)" | cut -s -d "/" -f 4); do
+  apt purge --yes "linux-headers-$kver" || echo "Warning: Failed to purge linux-headers-$kver, continuing..."
+  apt purge --yes "linux-image-$kver"   || echo "Warning: Failed to purge linux-image-$kver, continuing..."
+done
 
 apt update
 export PATH=$PATH:/usr/sbin
