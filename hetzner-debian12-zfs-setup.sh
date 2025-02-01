@@ -28,7 +28,7 @@ declare -a v_selected_disks
 v_swap_size=                 # integer
 v_free_tail_space=           # integer
 v_hostname=
-v_kernel_variant='6.11.3'
+v_kernel_variant=
 v_zfs_arc_max_mb=
 v_root_password=
 v_encrypt_rpool=             # 0=false, 1=true
