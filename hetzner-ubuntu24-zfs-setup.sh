@@ -510,26 +510,48 @@ echo "======= create zfs pools and datasets =========="
     bpool_disks_partitions+=("${selected_disk}-part2")
   done
 
-  if [[ ${#v_selected_disks[@]} -gt 1 ]]; then
-    pools_mirror_option=mirror
+  # --- Adjusted for RAID10 with 4 disks ---
+  if [[ ${#v_selected_disks[@]} -eq 4 ]]; then
+    echo "Creating RAID10 (stripe of two mirrors) for boot pool..."
+    zpool create \
+      $v_bpool_tweaks -O canmount=off -O devices=off \
+      -o cachefile=/etc/zpool.cache \
+      -O mountpoint=/boot -R $c_zfs_mount_dir -f \
+      $v_bpool_name \
+      mirror "${bpool_disks_partitions[0]}" "${bpool_disks_partitions[1]}" \
+      mirror "${bpool_disks_partitions[2]}" "${bpool_disks_partitions[3]}"
+
+    echo "Creating RAID10 (stripe of two mirrors) for root pool..."
+    echo -n "$v_passphrase" | zpool create \
+      $v_rpool_tweaks \
+      -o cachefile=/etc/zpool.cache \
+      "${encryption_options[@]}" \
+      -O mountpoint=/ -R $c_zfs_mount_dir -f \
+      $v_rpool_name \
+      mirror "${rpool_disks_partitions[0]}" "${rpool_disks_partitions[1]}" \
+      mirror "${rpool_disks_partitions[2]}" "${rpool_disks_partitions[3]}"
   else
-    pools_mirror_option=
+    if [[ ${#v_selected_disks[@]} -gt 1 ]]; then
+      pools_mirror_option=mirror
+    else
+      pools_mirror_option=
+    fi
+    # Original behavior for boot pool
+    zpool create \
+      $v_bpool_tweaks -O canmount=off -O devices=off \
+      -o cachefile=/etc/zpool.cache \
+      -O mountpoint=/boot -R $c_zfs_mount_dir -f \
+      $v_bpool_name $pools_mirror_option "${bpool_disks_partitions[@]}"
+
+    # Original behavior for root pool
+    echo -n "$v_passphrase" | zpool create \
+      $v_rpool_tweaks \
+      -o cachefile=/etc/zpool.cache \
+      "${encryption_options[@]}" \
+      -O mountpoint=/ -R $c_zfs_mount_dir -f \
+      $v_rpool_name $pools_mirror_option "${rpool_disks_partitions[@]}"
   fi
-
-# shellcheck disable=SC2086
-zpool create \
-  $v_bpool_tweaks -O canmount=off -O devices=off \
-  -o cachefile=/etc/zpool.cache \
-  -O mountpoint=/boot -R $c_zfs_mount_dir -f \
-  $v_bpool_name $pools_mirror_option "${bpool_disks_partitions[@]}"
-
-# shellcheck disable=SC2086
-echo -n "$v_passphrase" | zpool create \
-  $v_rpool_tweaks \
-  -o cachefile=/etc/zpool.cache \
-  "${encryption_options[@]}" \
-  -O mountpoint=/ -R $c_zfs_mount_dir -f \
-  $v_rpool_name $pools_mirror_option "${rpool_disks_partitions[@]}"
+  # --- End of RAID10 adjustments ---
 
 zfs create -o canmount=off -o mountpoint=none "$v_rpool_name/ROOT"
 zfs create -o canmount=off -o mountpoint=none "$v_bpool_name/BOOT"
