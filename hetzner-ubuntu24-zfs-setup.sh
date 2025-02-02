@@ -40,6 +40,9 @@ v_suitable_disks=()
 c_deb_packages_repo=http://mirror.hetzner.de/ubuntu/packages
 c_deb_security_repo=http://mirror.hetzner.de/ubuntu/security
 
+# Add the debconf preconfiguration for libc6 restart without asking
+echo "libc6 libraries/restart-without-asking boolean true" | debconf-set-selections
+
 c_default_zfs_arc_max_mb=250
 c_default_bpool_tweaks="-o ashift=12 -O compression=lz4"
 c_default_rpool_tweaks="-o ashift=12 -O acltype=posixacl -O compression=zstd-9 -O dnodesize=auto -O relatime=on -O xattr=sa -O normalization=formD"
@@ -65,7 +68,7 @@ function print_step_info_header {
 # ${FUNCNAME[1]}"
 
   if [[ "${1:-}" != "" ]]; then
-    echo -n " $1" 
+    echo -n " $1"
   fi
 
   echo "
@@ -403,7 +406,7 @@ function unmount_and_export_fs {
   echo "===========exporting zfs pools============="
   set +e
   while (( zpools_exported == 99 )) && (( SECONDS++ <= 60 )); do
-    
+
     if zpool export -a 2> /dev/null; then
       zpools_exported=1
       echo "all zfs pools were succesfully exported"
@@ -462,96 +465,83 @@ for kver in $(find /lib/modules/* -maxdepth 0 -type d | grep -v "$(uname -r)" | 
 done
 
 echo "======= installing zfs on rescue system =========="
-  #echo "zfs-dkms zfs-dkms/note-incompatible-licenses note true" | debconf-set-selections
-#  echo "y" | zfs
-# linux-headers-generic linux-image-generic
-  #apt install --yes software-properties-common dpkg-dev dkms
-#  rm -f "$(which zfs)"
-#  rm -f "$(which zpool)"
-#  echo -e "deb http://deb.debian.org/debian/ testing main contrib non-free\ndeb http://deb.debian.org/debian/ testing main contrib non-free\n" >/etc/apt/sources.list.d/bookworm-testing.list
-#  echo -e "Package: src:zfs-linux\nPin: release n=testing\nPin-Priority: 990\n" > /etc/apt/preferences.d/90_zfs
-#  apt update
-#  apt install -t testing --yes zfs-dkms zfsutils-linux
-#  rm /etc/apt/sources.list.d/bookworm-testing.list
-#  rm /etc/apt/preferences.d/90_zfs
-  apt update
-  export PATH=$PATH:/usr/sbin
-  zfs --version
+apt update
+export PATH=$PATH:/usr/sbin
+zfs --version
 
 echo "======= partitioning the disk =========="
 
-  if [[ $v_free_tail_space -eq 0 ]]; then
-    tail_space_parameter=0
-  else
-    tail_space_parameter="-${v_free_tail_space}G"
-  fi
+if [[ $v_free_tail_space -eq 0 ]]; then
+  tail_space_parameter=0
+else
+  tail_space_parameter="-${v_free_tail_space}G"
+fi
 
-  for selected_disk in "${v_selected_disks[@]}"; do
-    wipefs --all --force "$selected_disk"
-    sgdisk -a1 -n1:24K:+1000K            -t1:EF02 "$selected_disk"
-    sgdisk -n2:0:+2G                   -t2:BF01 "$selected_disk" # Boot pool
-    sgdisk -n3:0:"$tail_space_parameter" -t3:BF01 "$selected_disk" # Root pool
-  done
+for selected_disk in "${v_selected_disks[@]}"; do
+  wipefs --all --force "$selected_disk"
+  sgdisk -a1 -n1:24K:+1000K            -t1:EF02 "$selected_disk"
+  sgdisk -n2:0:+2G                   -t2:BF01 "$selected_disk" # Boot pool
+  sgdisk -n3:0:"$tail_space_parameter" -t3:BF01 "$selected_disk" # Root pool
+done
 
-  udevadm settle
+udevadm settle
 
 echo "======= create zfs pools and datasets =========="
 
-  encryption_options=()
-  rpool_disks_partitions=()
-  bpool_disks_partitions=()
+encryption_options=()
+rpool_disks_partitions=()
+bpool_disks_partitions=()
 
-  if [[ $v_encrypt_rpool == "1" ]]; then
-    encryption_options=(-O "encryption=aes-256-gcm" -O "keylocation=prompt" -O "keyformat=passphrase")
-  fi
+if [[ $v_encrypt_rpool == "1" ]]; then
+  encryption_options=(-O "encryption=aes-256-gcm" -O "keylocation=prompt" -O "keyformat=passphrase")
+fi
 
-  for selected_disk in "${v_selected_disks[@]}"; do
-    rpool_disks_partitions+=("${selected_disk}-part3")
-    bpool_disks_partitions+=("${selected_disk}-part2")
-  done
+for selected_disk in "${v_selected_disks[@]}"; do
+  rpool_disks_partitions+=("${selected_disk}-part3")
+  bpool_disks_partitions+=("${selected_disk}-part2")
+done
 
-  # --- Adjusted for RAID10 with 4 disks ---
-  if [[ ${#v_selected_disks[@]} -eq 4 ]]; then
-    echo "Creating RAID10 (stripe of two mirrors) for boot pool..."
-    zpool create \
-      $v_bpool_tweaks -O canmount=off -O devices=off \
-      -o cachefile=/etc/zpool.cache \
-      -O mountpoint=/boot -R $c_zfs_mount_dir -f \
-      $v_bpool_name \
-      mirror "${bpool_disks_partitions[0]}" "${bpool_disks_partitions[1]}" \
-      mirror "${bpool_disks_partitions[2]}" "${bpool_disks_partitions[3]}"
+if [[ ${#v_selected_disks[@]} -eq 4 ]]; then
+  # Optimal configuration for 4 disks: create two mirrored vdevs (striped mirrors)
+  bpool_vdev1=("${bpool_disks_partitions[@]:0:2}")
+  bpool_vdev2=("${bpool_disks_partitions[@]:2:2}")
+  rpool_vdev1=("${rpool_disks_partitions[@]:0:2}")
+  rpool_vdev2=("${rpool_disks_partitions[@]:2:2}")
 
-    echo "Creating RAID10 (stripe of two mirrors) for root pool..."
-    echo -n "$v_passphrase" | zpool create \
-      $v_rpool_tweaks \
-      -o cachefile=/etc/zpool.cache \
-      "${encryption_options[@]}" \
-      -O mountpoint=/ -R $c_zfs_mount_dir -f \
-      $v_rpool_name \
-      mirror "${rpool_disks_partitions[0]}" "${rpool_disks_partitions[1]}" \
-      mirror "${rpool_disks_partitions[2]}" "${rpool_disks_partitions[3]}"
+  zpool create \
+    $v_bpool_tweaks -O canmount=off -O devices=off \
+    -o cachefile=/etc/zpool.cache \
+    -o compatibility=grub2 \
+    -O mountpoint=/boot -R $c_zfs_mount_dir -f \
+    $v_bpool_name mirror "${bpool_vdev1[@]}" mirror "${bpool_vdev2[@]}"
+
+  echo -n "$v_passphrase" | zpool create \
+    $v_rpool_tweaks \
+    -o cachefile=/etc/zpool.cache \
+    "${encryption_options[@]}" \
+    -O mountpoint=/ -R $c_zfs_mount_dir -f \
+    $v_rpool_name mirror "${rpool_vdev1[@]}" mirror "${rpool_vdev2[@]}"
+else
+  if [[ ${#v_selected_disks[@]} -gt 1 ]]; then
+    pools_mirror_option=mirror
   else
-    if [[ ${#v_selected_disks[@]} -gt 1 ]]; then
-      pools_mirror_option=mirror
-    else
-      pools_mirror_option=
-    fi
-    # Original behavior for boot pool
-    zpool create \
-      $v_bpool_tweaks -O canmount=off -O devices=off \
-      -o cachefile=/etc/zpool.cache \
-      -O mountpoint=/boot -R $c_zfs_mount_dir -f \
-      $v_bpool_name $pools_mirror_option "${bpool_disks_partitions[@]}"
-
-    # Original behavior for root pool
-    echo -n "$v_passphrase" | zpool create \
-      $v_rpool_tweaks \
-      -o cachefile=/etc/zpool.cache \
-      "${encryption_options[@]}" \
-      -O mountpoint=/ -R $c_zfs_mount_dir -f \
-      $v_rpool_name $pools_mirror_option "${rpool_disks_partitions[@]}"
+    pools_mirror_option=
   fi
-  # --- End of RAID10 adjustments ---
+
+  zpool create \
+    $v_bpool_tweaks -O canmount=off -O devices=off \
+    -o cachefile=/etc/zpool.cache \
+    -o compatibility=grub2 \
+    -O mountpoint=/boot -R $c_zfs_mount_dir -f \
+    $v_bpool_name $pools_mirror_option "${bpool_disks_partitions[@]}"
+
+  echo -n "$v_passphrase" | zpool create \
+    $v_rpool_tweaks \
+    -o cachefile=/etc/zpool.cache \
+    "${encryption_options[@]}" \
+    -O mountpoint=/ -R $c_zfs_mount_dir -f \
+    $v_rpool_name $pools_mirror_option "${rpool_disks_partitions[@]}"
+fi
 
 zfs create -o canmount=off -o mountpoint=none "$v_rpool_name/ROOT"
 zfs create -o canmount=off -o mountpoint=none "$v_bpool_name/BOOT"
@@ -562,25 +552,24 @@ zfs mount "$v_rpool_name/ROOT/ubuntu"
 zfs create -o canmount=noauto -o mountpoint=/boot "$v_bpool_name/BOOT/ubuntu"
 zfs mount "$v_bpool_name/BOOT/ubuntu"
 
-zfs create                                 "$v_rpool_name/home"
-#zfs create -o mountpoint=/root             "$v_rpool_name/home/root"
-zfs create -o canmount=off                 "$v_rpool_name/var"
-zfs create                                 "$v_rpool_name/var/log"
-zfs create                                 "$v_rpool_name/var/spool"
+#zfs create                                 "$v_rpool_name/home"
+#zfs create -o canmount=off                 "$v_rpool_name/var"
+#zfs create                                 "$v_rpool_name/var/log"
+#zfs create                                 "$v_rpool_name/var/spool"
 
-zfs create -o com.sun:auto-snapshot=false  "$v_rpool_name/var/cache"
-zfs create -o com.sun:auto-snapshot=false  "$v_rpool_name/var/tmp"
-chmod 1777 "$c_zfs_mount_dir/var/tmp"
+#zfs create -o com.sun:auto-snapshot=false  "$v_rpool_name/var/cache"
+#zfs create -o com.sun:auto-snapshot=false  "$v_rpool_name/var/tmp"
+#chmod 1777 "$c_zfs_mount_dir/var/tmp"
 
-zfs create                                 "$v_rpool_name/srv"
+#zfs create                                 "$v_rpool_name/srv"
 
-zfs create -o canmount=off                 "$v_rpool_name/usr"
-zfs create                                 "$v_rpool_name/usr/local"
+#zfs create -o canmount=off                 "$v_rpool_name/usr"
+#zfs create                                 "$v_rpool_name/usr/local"
 
-zfs create                                 "$v_rpool_name/var/mail"
+#zfs create                                 "$v_rpool_name/var/mail"
 
-zfs create -o com.sun:auto-snapshot=false -o canmount=on -o mountpoint=/tmp "$v_rpool_name/tmp"
-chmod 1777 "$c_zfs_mount_dir/tmp"
+#zfs create -o com.sun:auto-snapshot=false -o canmount=on -o mountpoint=/tmp "$v_rpool_name/tmp"
+#chmod 1777 "$c_zfs_mount_dir/tmp"
 
 if [[ $v_swap_size -gt 0 ]]; then
   zfs create \
@@ -594,7 +583,7 @@ if [[ $v_swap_size -gt 0 ]]; then
 fi
 
 echo "======= setting up initial system packages =========="
-debootstrap --arch=amd64 mantic "$c_zfs_mount_dir" "$c_deb_packages_repo"
+debootstrap --arch=amd64 noble "$c_zfs_mount_dir" "$c_deb_packages_repo"
 
 zfs set devices=off "$v_rpool_name"
 
@@ -646,11 +635,11 @@ done
 
 echo "======= setting apt repos =========="
 cat > "$c_zfs_mount_dir/etc/apt/sources.list" <<CONF
-deb [arch=i386,amd64] $c_deb_packages_repo mantic main restricted
-deb [arch=i386,amd64] $c_deb_packages_repo mantic-updates main restricted
-deb [arch=i386,amd64] $c_deb_packages_repo mantic-backports main restricted
-deb [arch=i386,amd64] $c_deb_packages_repo mantic universe
-deb [arch=i386,amd64] $c_deb_security_repo mantic-security main restricted
+deb [arch=i386,amd64] $c_deb_packages_repo noble main restricted
+deb [arch=i386,amd64] $c_deb_packages_repo noble-updates main restricted
+deb [arch=i386,amd64] $c_deb_packages_repo noble-backports main restricted
+deb [arch=i386,amd64] $c_deb_packages_repo noble universe
+deb [arch=i386,amd64] $c_deb_security_repo noble-security main restricted
 CONF
 
 chroot_execute "apt update"
@@ -709,10 +698,8 @@ chroot_execute "dpkg-reconfigure tzdata -f noninteractive "
 echo "======= installing latest kernel============="
 chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes linux-headers${v_kernel_variant} linux-image${v_kernel_variant}"
 if [[ $v_kernel_variant == "-virtual" ]]; then
-  # linux-image-extra is only available for virtual hosts
   chroot_execute "DEBIAN_FRONTEND=noninteractive apt install --yes linux-image-extra-virtual"
 fi
-
 
 echo "======= installing aux packages =========="
 chroot_execute "apt install --yes man-db wget curl software-properties-common nano htop gnupg"
@@ -731,9 +718,6 @@ else
   chroot_execute "apt install --yes zfs-initramfs zfs-dkms zfsutils-linux"
 fi
 chroot_execute 'cat << DKMS > /etc/dkms/zfs.conf
-# override for /usr/src/zfs-*/dkms.conf:
-# always rebuild initrd when zfs module has been changed
-# (either by a ZFS update or a new kernel version)
 REMAKE_INITRD="yes"
 DKMS'
 
